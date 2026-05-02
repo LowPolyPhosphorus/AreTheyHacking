@@ -16,7 +16,7 @@ const app = new App({
 receiver.router.get("/health", (req, res) => res.send("OK"));
 
 // ─── /hackatime slash command ─────────────────────────────────────────────────
-app.command("/hackatime", async ({ command, ack, respond }) => {
+app.command("/link-aretheyacking", async ({ command, ack, respond }) => {
   await ack();
 
   const parts = command.text.trim().split(/\s+/);
@@ -37,7 +37,7 @@ app.command("/hackatime", async ({ command, ack, respond }) => {
     if (!linked) {
       await respond({
         response_type: "ephemeral",
-        text: `You haven't linked a Hackatime account yet. Run \`/hackatime connect <your-username>\` to set it up.`,
+        text: `You haven't linked a Hackatime account yet. Run \`/link-aretheyacking connect <your-username>\` to set it up.`,
       });
       return;
     }
@@ -53,7 +53,7 @@ app.command("/hackatime", async ({ command, ack, respond }) => {
 
   await respond({
     response_type: "ephemeral",
-    text: `*Hackatime Bot commands:*\n• \`/hackatime connect <username>\` — link your Hackatime account\n• \`/hackatime status\` — check your own current status`,
+    text: `*Hackatime Bot commands:*\n• \`/link-aretheyacking connect <username>\` — link your Hackatime account\n• \`/link-aretheyacking status\` — check your own current status`,
   });
 });
 
