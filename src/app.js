@@ -217,4 +217,17 @@ const PORT = process.env.PORT || 3000;
 (async () => {
   await app.start(PORT);
   console.log("⚡ AreTheyHacking running on port " + PORT);
+  try {
+    let cursor;
+    do {
+      const res = await app.client.conversations.list({ types: "public_channel", limit: 200, cursor });
+      for (const channel of res.channels) {
+        try { await app.client.conversations.join({ channel: channel.id }); } catch {}
+      }
+      cursor = res.response_metadata?.next_cursor;
+    } while (cursor);
+    console.log("[startup] joined all public channels");
+  } catch (err) {
+    console.error("[startup] failed to join channels:", err.message);
+  }
 })();
