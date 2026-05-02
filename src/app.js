@@ -1,6 +1,9 @@
 require("dotenv").config();
 const { App, ExpressReceiver } = require("@slack/bolt");
 const { checkHackatimeStatus } = require("./hackatime");
+const { getToken, saveToken } = require("./store");
+const crypto = require("crypto");
+const axios = require("axios");
 
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -11,98 +14,176 @@ const app = new App({
   receiver,
 });
 
-// Health check for Render
+// ─── Health check ─────────────────────────────────────────────────────────────
 receiver.router.get("/health", (req, res) => res.send("OK"));
 
-// ─── /aretheyhacking [username] ───────────────────────────────────────────────
-// No args → check yourself
-// With username → check that person
+// ─── OAuth callback from Hackatime ────────────────────────────────────────────
+// After user approves, Hackatime redirects here with ?code=...&state=<slackUserId>
+receiver.router.get("/auth/callback", async (req, res) => {
+  const { code, state: slackUserId, error } = req.query;
+
+  if (error || !code || !slackUserId) {
+    return res.send("Authorization denied or something went wrong. You can close this tab.");
+  }
+
+  try {
+    // Exchange code for access token
+    const tokenRes = await axios.post(
+      "https://hackatime.hackclub.com/oauth/token",
+      {
+        client_id: process.env.HACKATIME_CLIENT_ID,
+        client_secret: process.env.HACKATIME_CLIENT_SECRET,
+        code,
+        redirect_uri: `${process.env.APP_URL}/auth/callback`,
+        grant_type: "authorization_code",
+      }
+    );
+
+    const accessToken = tokenRes.data.access_token;
+    if (!accessToken) throw new Error("No access token in response");
+
+    // Fetch their Hackatime username to confirm it worked
+    const meRes = await axios.get(
+      "https://hackatime.hackclub.com/api/v1/authenticated/me",
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+
+    const hackatimeUser = meRes.data;
+    await saveToken(slackUserId, accessToken, hackatimeUser);
+
+    // DM the user to confirm
+    await app.client.chat.postMessage({
+      token: process.env.SLACK_BOT_TOKEN,
+      channel: slackUserId,
+      text: `✅ You're registered! When someone @mentions you, I'll let them know if you're hacking.`,
+    });
+
+    res.send("All good! You're registered. You can close this tab and go back to hacking. 🟢");
+  } catch (err) {
+    console.error("[oauth callback]", err.response?.data ?? err.message);
+    res.send("Something went wrong exchanging your token. Try /register again.");
+  }
+});
+
+// ─── /register ────────────────────────────────────────────────────────────────
+// DMs the user a Hackatime OAuth link
+app.command("/register", async ({ command, ack, client }) => {
+  await ack();
+
+  const authUrl =
+    `https://hackatime.hackclub.com/oauth/authorize` +
+    `?client_id=${process.env.HACKATIME_CLIENT_ID}` +
+    `&redirect_uri=${encodeURIComponent(process.env.APP_URL + "/auth/callback")}` +
+    `&response_type=code` +
+    `&scope=profile+read` +
+    `&state=${command.user_id}`;
+
+  await client.chat.postMessage({
+    channel: command.user_id, // DM
+    text: `👋 Click here to link your Hackatime account:\n${authUrl}\n\nThis lets the bot check if you're currently hacking when someone @mentions you.`,
+  });
+
+  // Ephemeral ack in the channel so they know to check DMs
+  await client.chat.postEphemeral({
+    channel: command.channel_id,
+    user: command.user_id,
+    text: "📬 Check your DMs — I sent you a link to connect your Hackatime account!",
+  });
+});
+
+// ─── /aretheyhacking [username or @mention] ───────────────────────────────────
 app.command("/aretheyhacking", async ({ command, ack, respond, client }) => {
   await ack();
 
-  let targetSlackUsername;
+  let targetUserId;
   let targetDisplayName;
 
   const arg = command.text.trim();
 
   if (!arg) {
-    // No argument — check the person who ran the command
-    const userInfo = await client.users.info({ user: command.user_id });
-    targetSlackUsername = userInfo.user.name; // Hack Club SSO username
+    targetUserId = command.user_id;
     targetDisplayName = `<@${command.user_id}>`;
   } else {
-    // Strip <@U...> mention format if they @mentioned someone
     const mentionMatch = arg.match(/^<@([A-Z0-9]+)(?:\|[^>]+)?>$/);
     if (mentionMatch) {
-      const userInfo = await client.users.info({ user: mentionMatch[1] });
-      targetSlackUsername = userInfo.user.name;
+      targetUserId = mentionMatch[1];
       targetDisplayName = `<@${mentionMatch[1]}>`;
     } else {
-      // Plain text username
-      targetSlackUsername = arg.replace(/^@/, "");
-      targetDisplayName = `@${targetSlackUsername}`;
+      // Try to look up by username
+      try {
+        const list = await client.users.list();
+        const found = list.members.find(
+          (m) => m.name === arg.replace(/^@/, "") || m.profile?.display_name === arg.replace(/^@/, "")
+        );
+        if (found) {
+          targetUserId = found.id;
+          targetDisplayName = `<@${found.id}>`;
+        } else {
+          await respond({ response_type: "ephemeral", text: `Couldn't find user \`${arg}\`.` });
+          return;
+        }
+      } catch {
+        await respond({ response_type: "ephemeral", text: "Couldn't look up that user." });
+        return;
+      }
     }
   }
 
-  const status = await checkHackatimeStatus(targetSlackUsername);
+  const token = await getToken(targetUserId);
+  if (!token) {
+    await respond({
+      response_type: "in_channel",
+      text: `🤷 ${targetDisplayName} hasn't linked their Hackatime account yet. They can run \`/register\` to connect.`,
+    });
+    return;
+  }
+
+  const status = await checkHackatimeStatus(token);
 
   await respond({
     response_type: "in_channel",
-    blocks: buildStatusBlocks(targetDisplayName, targetSlackUsername, status),
+    blocks: buildStatusBlocks(targetDisplayName, status),
     text: status.coding
-      ? `${targetDisplayName} is currently hacking on ${status.project || "a project"}!`
-      : `${targetDisplayName} doesn't appear to be hacking right now.`,
+      ? `${targetDisplayName} is currently hacking!`
+      : `${targetDisplayName} isn't hacking right now.`,
   });
 });
 
-// ─── Silently watch ALL messages for @mentions ────────────────────────────────
-// Only replies if the mentioned person is actively coding on Hackatime.
+// ─── Passive @mention listener ────────────────────────────────────────────────
 app.event("message", async ({ event, client, say }) => {
   if (event.subtype || event.bot_id || !event.text) return;
 
-  const mentionedIds = [...event.text.matchAll(/<@([A-Z0-9]+)>/g)].map(
-    (m) => m[1]
-  );
+  const mentionedIds = [...event.text.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]);
   if (mentionedIds.length === 0) return;
 
   for (const userId of mentionedIds) {
     if (userId === event.user) continue;
 
-    let slackUsername;
-    try {
-      const userInfo = await client.users.info({ user: userId });
-      slackUsername = userInfo.user.name;
-    } catch {
-      continue;
-    }
+    const token = await getToken(userId);
+    if (!token) continue;
 
-    const status = await checkHackatimeStatus(slackUsername);
-    if (!status.coding) continue; // silent if not coding
+    const status = await checkHackatimeStatus(token);
+    if (!status.coding) continue;
 
     await say({
       channel: event.channel,
       thread_ts: event.ts,
-      blocks: buildStatusBlocks(`<@${userId}>`, slackUsername, status),
-      text: `Heads up — <@${userId}> is currently hacking on ${status.project || "a project"}!`,
+      blocks: buildStatusBlocks(`<@${userId}>`, status),
+      text: `Heads up — <@${userId}> is currently hacking!`,
     });
   }
 });
 
 // ─── Block builder ────────────────────────────────────────────────────────────
-
-function buildStatusBlocks(displayName, username, status) {
+function buildStatusBlocks(displayName, status) {
   if (!status.coding) {
     return [
       {
         type: "section",
         text: {
           type: "mrkdwn",
-          text: `⚫ *${displayName} isn't currently hacking.*\nNo Hackatime activity in the last 2 minutes — they should be free!`,
+          text: `⚫ *${displayName} isn't currently hacking.*\nNo activity in the last 2 minutes — they should be free!`,
         },
-      },
-      {
-        type: "context",
-        elements: [{ type: "mrkdwn", text: `Hackatime user: \`${username}\`` }],
       },
     ];
   }
@@ -117,34 +198,22 @@ function buildStatusBlocks(displayName, username, status) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `🟢 *${displayName} is currently hacking!*\nThey may be heads-down — expect some delays in their response.`,
+        text: `🟢 *${displayName} is currently hacking!*\nThey may be heads-down — expect some delays.`,
       },
     },
     {
       type: "section",
       fields: [
-        {
-          type: "mrkdwn",
-          text: `*Project*\n📁 ${status.project || "Unknown"}`,
-        },
-        {
-          type: "mrkdwn",
-          text: `*Language*\n${langEmoji} ${status.language || "Unknown"}`,
-        },
-        ...(status.editor
-          ? [{ type: "mrkdwn", text: `*Editor*\n🖥️ ${status.editor}` }]
-          : []),
-        ...(durationText
-          ? [{ type: "mrkdwn", text: `*Today's Session*\n⏱️ ${durationText}` }]
-          : []),
+        { type: "mrkdwn", text: `*Project*\n📁 ${status.project || "Unknown"}` },
+        { type: "mrkdwn", text: `*Language*\n${langEmoji} ${status.language || "Unknown"}` },
+        ...(status.editor ? [{ type: "mrkdwn", text: `*Editor*\n🖥️ ${status.editor}` }] : []),
+        ...(durationText ? [{ type: "mrkdwn", text: `*Today*\n⏱️ ${durationText}` }] : []),
       ],
     },
     { type: "divider" },
     {
       type: "context",
-      elements: [
-        { type: "mrkdwn", text: `Powered by Hackatime • \`${username}\`` },
-      ],
+      elements: [{ type: "mrkdwn", text: "Powered by Hackatime" }],
     },
   ];
 }
@@ -168,5 +237,5 @@ function getLangEmoji(language) {
 const PORT = process.env.PORT || 3000;
 (async () => {
   await app.start(PORT);
-  console.log(`⚡ Hackatime Slack Bot running on port ${PORT}`);
+  console.log(`⚡ AreTheyHacking running on port ${PORT}`);
 })();
