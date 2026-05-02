@@ -13,10 +13,8 @@ const app = new App({
   receiver,
 });
 
-// ─── Health check ─────────────────────────────────────────────────────────────
 receiver.router.get("/health", (req, res) => res.send("OK"));
 
-// ─── OAuth callback from Hackatime ────────────────────────────────────────────
 receiver.router.get("/auth/callback", async (req, res) => {
   const { code, state: slackUserId, error } = req.query;
 
@@ -50,17 +48,16 @@ receiver.router.get("/auth/callback", async (req, res) => {
     await app.client.chat.postMessage({
       token: process.env.SLACK_BOT_TOKEN,
       channel: slackUserId,
-      text: "✅ You're registered! When someone @mentions you, I'll let them know if you're hacking.",
+      text: "You're registered! When someone @mentions you, I'll let them know if you're hacking.",
     });
 
-    res.send("All good! You're registered. You can close this tab and go back to hacking. 🟢");
+    res.send("All good! You're registered. You can close this tab and go back to hacking.");
   } catch (err) {
     console.error("[oauth callback]", err.response?.data ?? err.message);
     res.send("Something went wrong exchanging your token. Try /register again.");
   }
 });
 
-// ─── /register ────────────────────────────────────────────────────────────────
 app.command("/register", async ({ command, ack, client }) => {
   await ack();
 
@@ -74,17 +71,16 @@ app.command("/register", async ({ command, ack, client }) => {
 
   await client.chat.postMessage({
     channel: command.user_id,
-    text: "👋 Click here to link your Hackatime account:\n" + authUrl + "\n\nThis lets the bot check if you're currently hacking when someone @mentions you.",
+    text: "Click here to link your Hackatime account:\n" + authUrl,
   });
 
   await client.chat.postEphemeral({
     channel: command.channel_id,
     user: command.user_id,
-    text: "📬 Check your DMs — I sent you a link to connect your Hackatime account!",
+    text: "Check your DMs — I sent you a link to connect your Hackatime account!",
   });
 });
 
-// ─── /aretheyhacking ──────────────────────────────────────────────────────────
 app.command("/aretheyhacking", async ({ command, ack, respond, client }) => {
   await ack();
 
@@ -143,37 +139,40 @@ app.command("/aretheyhacking", async ({ command, ack, respond, client }) => {
   });
 });
 
-// ─── Passive @mention listener (works in public + private channels) ───────────
-async function handleMentionEvent(event, say) {
-  if (event.subtype || event.bot_id || !event.text) return;
+app.event("message", async ({ event, say }) => {
+  try {
+    if (event.subtype || event.bot_id || !event.text) return;
 
-  const mentionedIds = [...event.text.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]);
-  if (mentionedIds.length === 0) return;
+    const mentionedIds = [...event.text.matchAll(/<@([A-Z0-9]+)>/g)].map((m) => m[1]);
+    if (mentionedIds.length === 0) return;
 
-  console.log("[debug] message event channel_type:", event.channel_type, "mentions:", mentionedIds);
+    console.log("[debug] message event channel_type:", event.channel_type, "mentions:", mentionedIds);
 
-  for (const userId of mentionedIds) {
-    if (userId === event.user) continue;
+    for (const userId of mentionedIds) {
+      if (userId === event.user) continue;
 
-    const token = await getToken(userId);
-    console.log("[debug] token for", userId, ":", token ? "found" : "null");
-    if (!token) continue;
+      console.log("[debug] checking token for", userId);
+      const token = await getToken(userId);
+      console.log("[debug] token:", token ? "found" : "null");
+      if (!token) continue;
 
-    const status = await checkHackatimeStatus(token);
-    if (!status.coding) continue;
+      console.log("[debug] checking hackatime status");
+      const status = await checkHackatimeStatus(token);
+      console.log("[debug] status:", JSON.stringify(status));
+      if (!status.coding) continue;
 
-    await say({
-      channel: event.channel,
-      thread_ts: event.ts,
-      blocks: buildStatusBlocks("<@" + userId + ">", status),
-      text: "Heads up — <@" + userId + "> is currently hacking!",
-    });
+      await say({
+        channel: event.channel,
+        thread_ts: event.ts,
+        blocks: buildStatusBlocks("<@" + userId + ">", status),
+        text: "Heads up — <@" + userId + "> is currently hacking!",
+      });
+    }
+  } catch (err) {
+    console.error("[mention handler error]", err.message, err.stack);
   }
-}
+});
 
-app.event("message", async ({ event, say }) => handleMentionEvent(event, say));
-
-// ─── Block builder ────────────────────────────────────────────────────────────
 function buildStatusBlocks(displayName, status) {
   if (!status.coding) {
     return [
@@ -194,7 +193,7 @@ function buildStatusBlocks(displayName, status) {
 
   const fields = [
     { type: "mrkdwn", text: "*Project*\n📁 " + (status.project || "Unknown") },
-    { type: "mrkdwn", text: "*Language*\n" + langEmoji + " " + (status.language || "Unknown") },
+    { type: "mrkdwn", text: "*Language*\n" + getLangEmoji(status.language) + " " + (status.language || "Unknown") },
   ];
   if (status.editor) fields.push({ type: "mrkdwn", text: "*Editor*\n🖥️ " + status.editor });
   if (durationText) fields.push({ type: "mrkdwn", text: "*Today*\n⏱️ " + durationText });
@@ -231,7 +230,6 @@ function getLangEmoji(language) {
   return "💻";
 }
 
-// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 (async () => {
   await app.start(PORT);
