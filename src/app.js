@@ -156,6 +156,7 @@ async function handleMentionEvent(event, say) {
     if (userId === event.user) continue;
 
     const token = await getToken(userId);
+    console.log("[debug] token for", userId, ":", token ? "found" : "null");
     if (!token) continue;
 
     const status = await checkHackatimeStatus(token);
