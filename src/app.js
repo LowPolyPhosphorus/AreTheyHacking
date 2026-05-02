@@ -99,25 +99,8 @@ app.command("/aretheyhacking", async ({ command, ack, respond, client }) => {
       targetUserId = mentionMatch[1];
       targetDisplayName = "<@" + mentionMatch[1] + ">";
     } else {
-      try {
-        const list = await client.users.list();
-        const me = list.members.find(m => m.id === command.user_id);
-        console.log("[debug] my slack user:", JSON.stringify({ name: me?.name, display: me?.profile?.display_name, real: me?.profile?.real_name }));
-        const clean = arg.replace(/^@/, "").toLowerCase();
-        const found = list.members.find(
-          (m) => m.name?.toLowerCase() === clean || m.profile?.display_name?.toLowerCase() === clean || m.profile?.real_name?.toLowerCase() === clean
-        );
-        if (found) {
-          targetUserId = found.id;
-          targetDisplayName = "<@" + found.id + ">";
-        } else {
-          await respond({ response_type: "ephemeral", text: "Couldn't find user `" + arg + "`." });
-          return;
-        }
-      } catch {
-        await respond({ response_type: "ephemeral", text: "Couldn't look up that user." });
-        return;
-      }
+      await respond({ response_type: "ephemeral", text: "Please @mention someone directly, e.g. `/aretheyhacking @name` — make sure to select them from the dropdown so Slack can resolve their ID." });
+      return;
     }
   }
 
