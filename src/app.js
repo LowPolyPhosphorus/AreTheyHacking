@@ -149,8 +149,6 @@ app.event("message", async ({ event, say }) => {
     console.log("[debug] message event channel_type:", event.channel_type, "mentions:", mentionedIds);
 
     for (const userId of mentionedIds) {
-      if (userId === event.user) continue;
-
       console.log("[debug] checking token for", userId);
       const token = await getToken(userId);
       console.log("[debug] token:", token ? "found" : "null");
