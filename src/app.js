@@ -101,9 +101,11 @@ app.command("/aretheyhacking", async ({ command, ack, respond, client }) => {
     } else {
       try {
         const list = await client.users.list();
-        const clean = arg.replace(/^@/, "");
+        const me = list.members.find(m => m.id === command.user_id);
+        console.log("[debug] my slack user:", JSON.stringify({ name: me?.name, display: me?.profile?.display_name, real: me?.profile?.real_name }));
+        const clean = arg.replace(/^@/, "").toLowerCase();
         const found = list.members.find(
-          (m) => m.name === clean || m.profile?.display_name === clean
+          (m) => m.name?.toLowerCase() === clean || m.profile?.display_name?.toLowerCase() === clean || m.profile?.real_name?.toLowerCase() === clean
         );
         if (found) {
           targetUserId = found.id;
