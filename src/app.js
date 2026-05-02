@@ -1,7 +1,6 @@
 require("dotenv").config();
 const { App, ExpressReceiver } = require("@slack/bolt");
 const { checkHackatimeStatus } = require("./hackatime");
-const { getUser, saveUser } = require("./store");
 
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -15,77 +14,75 @@ const app = new App({
 // Health check for Render
 receiver.router.get("/health", (req, res) => res.send("OK"));
 
-// ─── /hackatime slash command ─────────────────────────────────────────────────
-app.command("/aretheyhacking", async ({ command, ack, respond }) => {
+// ─── /aretheyhacking [username] ───────────────────────────────────────────────
+// No args → check yourself
+// With username → check that person
+app.command("/aretheyhacking", async ({ command, ack, respond, client }) => {
   await ack();
 
-  const parts = command.text.trim().split(/\s+/);
-  const sub = parts[0]?.toLowerCase();
+  let targetSlackUsername;
+  let targetDisplayName;
 
-  if (sub === "connect" && parts[1]) {
-    const hackatimeUsername = parts[1].trim();
-    await saveUser(command.user_id, hackatimeUsername);
-    await respond({
-      response_type: "ephemeral",
-      text: `✅ Linked! I'll now watch for when you get @mentioned and let the channel know you're hacking.`,
-    });
-    return;
-  }
+  const arg = command.text.trim();
 
-  if (sub === "status") {
-    const linked = await getUser(command.user_id);
-    if (!linked) {
-      await respond({
-        response_type: "ephemeral",
-        text: `You haven't linked a Hackatime account yet. Run \`/aretheyhacking connect <your-username>\` to set it up.`,
-      });
-      return;
+  if (!arg) {
+    // No argument — check the person who ran the command
+    const userInfo = await client.users.info({ user: command.user_id });
+    targetSlackUsername = userInfo.user.name; // Hack Club SSO username
+    targetDisplayName = `<@${command.user_id}>`;
+  } else {
+    // Strip <@U...> mention format if they @mentioned someone
+    const mentionMatch = arg.match(/^<@([A-Z0-9]+)(?:\|[^>]+)?>$/);
+    if (mentionMatch) {
+      const userInfo = await client.users.info({ user: mentionMatch[1] });
+      targetSlackUsername = userInfo.user.name;
+      targetDisplayName = `<@${mentionMatch[1]}>`;
+    } else {
+      // Plain text username
+      targetSlackUsername = arg.replace(/^@/, "");
+      targetDisplayName = `@${targetSlackUsername}`;
     }
-    const status = await checkHackatimeStatus(linked);
-    await respond({
-      response_type: "ephemeral",
-      text: status.coding
-        ? `🟢 You're currently hacking — working on *${status.project || "something"}* in *${status.language || "unknown language"}*.`
-        : `⚫ No active Hackatime session detected right now.`,
-    });
-    return;
   }
+
+  const status = await checkHackatimeStatus(targetSlackUsername);
 
   await respond({
-    response_type: "ephemeral",
-    text: `*Hackatime Bot commands:*\n• \`/aretheyhacking connect <username>\` — link your Hackatime account\n• \`/aretheyhacking status\` — check your own current status`,
+    response_type: "in_channel",
+    blocks: buildStatusBlocks(targetDisplayName, targetSlackUsername, status),
+    text: status.coding
+      ? `${targetDisplayName} is currently hacking on ${status.project || "a project"}!`
+      : `${targetDisplayName} doesn't appear to be hacking right now.`,
   });
 });
 
-// ─── Silently watch ALL messages for @mentions of linked users ────────────────
-// No need to @bot. Only replies when the mentioned person IS actively coding.
-// Complete silence if not coding, not linked, or message is from a bot.
-app.event("message", async ({ event, say }) => {
-  // Ignore bot messages, edits, deletions, anything without text
+// ─── Silently watch ALL messages for @mentions ────────────────────────────────
+// Only replies if the mentioned person is actively coding on Hackatime.
+app.event("message", async ({ event, client, say }) => {
   if (event.subtype || event.bot_id || !event.text) return;
 
-  // Extract all @mentioned Slack user IDs
   const mentionedIds = [...event.text.matchAll(/<@([A-Z0-9]+)>/g)].map(
     (m) => m[1]
   );
   if (mentionedIds.length === 0) return;
 
   for (const userId of mentionedIds) {
-    // Skip self-mentions
     if (userId === event.user) continue;
 
-    // Only act on users who have linked their Hackatime account
-    const hackatimeUsername = await getUser(userId);
-    if (!hackatimeUsername) continue; // not linked — stay silent
+    let slackUsername;
+    try {
+      const userInfo = await client.users.info({ user: userId });
+      slackUsername = userInfo.user.name;
+    } catch {
+      continue;
+    }
 
-    const status = await checkHackatimeStatus(hackatimeUsername);
-    if (!status.coding) continue; // not coding — stay silent
+    const status = await checkHackatimeStatus(slackUsername);
+    if (!status.coding) continue; // silent if not coding
 
-    // Only reaches here if: linked AND actively coding right now
     await say({
       channel: event.channel,
       thread_ts: event.ts,
-      blocks: buildCodingBlocks(userId, hackatimeUsername, status),
+      blocks: buildStatusBlocks(`<@${userId}>`, slackUsername, status),
       text: `Heads up — <@${userId}> is currently hacking on ${status.project || "a project"}!`,
     });
   }
@@ -93,7 +90,23 @@ app.event("message", async ({ event, say }) => {
 
 // ─── Block builder ────────────────────────────────────────────────────────────
 
-function buildCodingBlocks(userId, username, status) {
+function buildStatusBlocks(displayName, username, status) {
+  if (!status.coding) {
+    return [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `⚫ *${displayName} isn't currently hacking.*\nNo Hackatime activity in the last 2 minutes — they should be free!`,
+        },
+      },
+      {
+        type: "context",
+        elements: [{ type: "mrkdwn", text: `Hackatime user: \`${username}\`` }],
+      },
+    ];
+  }
+
   const langEmoji = getLangEmoji(status.language);
   const durationText = status.todaySeconds
     ? `${Math.floor(status.todaySeconds / 3600)}h ${Math.floor((status.todaySeconds % 3600) / 60)}m coded today`
@@ -104,7 +117,7 @@ function buildCodingBlocks(userId, username, status) {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `🟢 *<@${userId}> is currently hacking!*\nThey may be heads-down — you might want to expect some delays in their response.`,
+        text: `🟢 *${displayName} is currently hacking!*\nThey may be heads-down — expect some delays in their response.`,
       },
     },
     {
@@ -130,10 +143,7 @@ function buildCodingBlocks(userId, username, status) {
     {
       type: "context",
       elements: [
-        {
-          type: "mrkdwn",
-          text: `Powered by Hackatime • \`${username}\``,
-        },
+        { type: "mrkdwn", text: `Powered by Hackatime • \`${username}\`` },
       ],
     },
   ];
