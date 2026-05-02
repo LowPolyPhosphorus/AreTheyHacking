@@ -18,6 +18,10 @@ async function checkHackatimeStatus(accessToken) {
     );
 
     const heartbeat = heartbeatRes.data;
+
+    console.log("[debug] latest heartbeat:", JSON.stringify(heartbeat));
+    console.log("[debug] now:", new Date().toISOString());
+
     if (!heartbeat?.created_at) return { coding: false };
 
     const coding = isRecent(heartbeat.created_at);
